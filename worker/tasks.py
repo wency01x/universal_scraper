@@ -2,9 +2,9 @@
 from celery import Celery
 from database.connection import SessionLocal
 from database.models import ScrapeJob
-import time
+from extractors.quotes_ext import QuotesExtractor
+from sqlalchemy.orm.attributes import flag_modified # <-- NEW IMPORT!
 
-# Connect Celery to your local Redis server
 celery_app = Celery(
     "scraper_worker",
     broker="redis://localhost:6379/0",
@@ -13,43 +13,32 @@ celery_app = Celery(
 
 @celery_app.task
 def run_scrape_job(job_id: int):
-    # 1. Open a database session
     db = SessionLocal()
-    
-    # 2. Find the job we need to process
     job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
     if not job:
         db.close()
         return
 
-    # 3. Mark the job as running
     job.status = "running"
     db.commit()
 
     try:
-        # 4. ---------------------------------------------------------
-        # THIS IS WHERE THE REAL SCRAPING HAPPENS LATER.
-        # For now, we will simulate a 3-second scrape to test the system.
-        print(f"Scraping {job.target_url}...")
-        time.sleep(3) 
+        print(f"[Worker] Launching Extractor for {job.target_url}...")
         
-        # Here is that dynamic dictionary we talked about!
-        simulated_scraped_data = {
-            "message": "Success!",
-            "raw_html_length": 5042,
-            "emails_found": ["contact@example.com"]
-        }
-        # -------------------------------------------------------------
+        scraper = QuotesExtractor(job.target_url)
+        real_data = scraper.run()
 
-        # 5. Save the data to that JSONB column and mark it complete
-        job.extracted_data = simulated_scraped_data
+        job.extracted_data = real_data
         job.status = "completed"
         
+        # <-- NEW COMMAND: Force the database to notice the JSON change
+        flag_modified(job, "extracted_data") 
+        
     except Exception as e:
-        # If the scraper crashes (e.g., website blocks us), catch it cleanly
         job.status = "failed"
         job.extracted_data = {"error": str(e)}
+        flag_modified(job, "extracted_data") # Flag it here too, just in case of an error
         
     finally:
-        db.commit()
+        db.commit() # Now it will actually save the data!
         db.close()
