@@ -1,0 +1,19 @@
+# Web Framework & Server
+fastapi==0.110.0
+uvicorn==0.27.1
+pydantic==2.6.3
+
+# Background Tasks & Queue
+celery==5.3.6
+redis==5.0.2
+
+# Database (PostgreSQL)
+SQLAlchemy==2.0.27
+psycopg2-binary==2.9.9
+
+# Scraping & Extraction
+playwright==1.42.0
+beautifulsoup4==4.12.3
+
+# Utilities
+python-dotenv==1.0.1
