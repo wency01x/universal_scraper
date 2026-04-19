@@ -1,55 +1,143 @@
 # extractors/amazon_ext.py
 from .base import BaseExtractor
-from bs4 import BeautifulSoup
+from lxml import html as lxml_html
 import re
+import json
+
 
 class AmazonExtractor(BaseExtractor):
-    def extract(self, html):
-        soup = BeautifulSoup(html, "html.parser")
+    def extract(self, raw_html):
+        """
+        Extract product data from Amazon HTML using XPath.
         
-        # 1. Get Title (scoped to centerCol for accuracy)
-        center_col = soup.find("div", id="centerCol")
-        search_area = center_col if center_col else soup
+        Price extraction priority:
+        1. Live-DOM XPath (extracted by Playwright in base.py — most reliable)
+        2. lxml XPath on the saved HTML (fallback)
+        3. Embedded JSON data parsing (last resort for OLP/third-party pages)
+        """
+        tree = lxml_html.fromstring(raw_html)
 
-        title_el = search_area.find("span", id="productTitle")
-        title = title_el.get_text(strip=True) if title_el else "Blocked/Not Found"
+        # ════════════════════════════════════════════════════════════════
+        # 1. TITLE — XPath extraction
+        # ════════════════════════════════════════════════════════════════
+        title_nodes = tree.xpath('//span[@id="productTitle"]/text()')
+        title = title_nodes[0].strip() if title_nodes else "Blocked/Not Found"
 
-        # 2. Get Price — search the ENTIRE page, not just centerCol
-        #    The price lives in the right-column buybox, NOT in centerCol.
-        raw_price = "Price Not Found"
+        # ════════════════════════════════════════════════════════════════
+        # 2. PRICE — Priority 1: Live-DOM price from Playwright (base.py)
+        # ════════════════════════════════════════════════════════════════
+        raw_price = None
         
-        # Strategy A: Hidden input field (most reliable, never empty)
-        hidden_price = soup.find("input", id="twister-plus-price-data-price")
-        hidden_unit = soup.find("input", id="twister-plus-price-data-price-unit")
-        if hidden_price and hidden_price.get("value"):
-            symbol = hidden_unit.get("value", "$") if hidden_unit else "$"
-            raw_price = f"{symbol}{hidden_price['value']}"
-            print(f"[AmazonExtractor] Strategy A (hidden input): {raw_price}")
-        else:
-            # Strategy B: CSS selector priority list on the full page
-            price_selectors = [
-                "#buybox .apex-pricetopay-value .a-offscreen",              # Buybox accordion price
-                "#corePriceDisplay_desktop_feature_div .priceToPay .a-offscreen",  # Core price display
-                "#corePrice_desktop .a-offscreen",                          # Classic core price
-                "#tp_price_block_total_price_ww .a-offscreen",              # Twister price block
-                "#price_inside_buybox",                                     # Inside Buy Box
-                "#priceblock_ourprice",                                     # Classic layout
-                "#priceblock_dealprice",                                    # Deal price
-                "#kindle-price",                                            # Digital/Books
+        if hasattr(self, '_live_price') and self._live_price:
+            raw_price = self._live_price
+            print(f"[AmazonExtractor] Using live-DOM XPath price: {raw_price}")
+
+        # ════════════════════════════════════════════════════════════════
+        # 3. PRICE — Priority 2: lxml XPath on saved HTML (fallback)
+        # ════════════════════════════════════════════════════════════════
+        if not raw_price:
+            xpath_selectors = [
+                # Hidden input (Amazon-owned Buy Box)
+                ('//input[@id="twister-plus-price-data-price"]/@value',
+                 "hidden_input", True),
+
+                # Accessibility label  
+                ('//span[contains(@class, "apex-pricetopay-accessibility-label")]/text()',
+                 "accessibility_label", False),
+
+                # Core price → priceToPay offscreen
+                ('//div[@id="corePrice_desktop"]//span[contains(@class, "priceToPay")]//span[@class="a-offscreen"]/text()',
+                 "corePrice_priceToPay", False),
+
+                # corePriceDisplay feature div
+                ('//div[@id="corePriceDisplay_desktop_feature_div"]//span[contains(@class, "priceToPay")]//span[@class="a-offscreen"]/text()',
+                 "corePriceDisplay", False),
+
+                # New Buy Box
+                ('//span[@id="newBuyBoxPrice"]//span[@class="a-offscreen"]/text()',
+                 "newBuyBox", False),
+
+                # Classic IDs
+                ('//span[@id="priceblock_ourprice"]/text()', "priceblock_ourprice", False),
+                ('//span[@id="priceblock_dealprice"]/text()', "priceblock_dealprice", False),
+                ('//span[@id="price_inside_buybox"]/text()', "price_inside_buybox", False),
+
+                # OLP "X options from $Y"
+                ('//span[contains(@class, "olpWrapper")]/text()',
+                 "olp_wrapper", False),
+
+                # Selected twister variant price (aria-hidden visible text)
+                ('//li[@data-initiallyselected="true"]//span[@aria-hidden="true" and contains(text(), "$")]/text()',
+                 "twister_selected_visible", False),
+
+                # Twister accessibility label price
+                ('//div[contains(@class, "apex_on_twister_price")]//span[contains(@class, "apex-pricetopay-accessibility-label")]/text()',
+                 "twister_apex_label", False),
+
+                # Any a-color-price with $
+                ('//span[contains(@class, "a-color-price") and contains(text(), "$")]/text()',
+                 "color_price", False),
             ]
 
-            for selector in price_selectors:
-                found = soup.select_one(selector)
-                if found:
-                    text = found.get_text(strip=True)
-                    if text and text != "":  # Skip empty/whitespace-only matches
-                        raw_price = text
-                        print(f"[AmazonExtractor] Strategy B matched: {selector} → {raw_price}")
+            for xpath, name, is_attr in xpath_selectors:
+                try:
+                    results = tree.xpath(xpath)
+                    for result in results:
+                        text = str(result).strip()
+                        if text and len(text) > 1:
+                            if is_attr:
+                                # Hidden input value — prepend $
+                                raw_price = f"${text}"
+                            else:
+                                raw_price = text
+                            print(f"[XPath-lxml] ✓ '{name}': {raw_price}")
+                            break
+                    if raw_price:
                         break
-        
-        # 3. DATA CLEANING
+                except Exception as e:
+                    print(f"[XPath-lxml] Error in '{name}': {e}")
+                    continue
+
+        # ════════════════════════════════════════════════════════════════
+        # 4. PRICE — Priority 3: Embedded JSON (OLP/third-party pages)
+        # ════════════════════════════════════════════════════════════════
+        if not raw_price:
+            script_nodes = tree.xpath('//script[@type="a-state"]/text()')
+            for script_text in script_nodes:
+                if raw_price:
+                    break
+                try:
+                    data = json.loads(script_text)
+                    if isinstance(data, dict) and "sortedDimValuesForAllDims" in data:
+                        for dim_name, dim_vals in data["sortedDimValuesForAllDims"].items():
+                            for dv in dim_vals:
+                                if dv.get("dimensionValueState") == "SELECTED":
+                                    for slot in dv.get("slots", []):
+                                        dd = slot.get("displayData", {})
+                                        olp_price = dd.get("priceWithoutCurrencySymbol", "")
+                                        if olp_price:
+                                            raw_price = f"${olp_price}"
+                                            print(f"[XPath-JSON] ✓ twister OLP price: {raw_price}")
+                                            break
+                                        olp_msg = dd.get("olpMessage", "")
+                                        if olp_msg:
+                                            m = re.search(r"\$(\d[\d,]*\.?\d*)", olp_msg)
+                                            if m:
+                                                raw_price = f"${m.group(1)}"
+                                                print(f"[XPath-JSON] ✓ twister OLP message: {raw_price}")
+                                                break
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    continue
+
+        # If still nothing, set default
+        if not raw_price:
+            raw_price = "Price Not Found"
+
+        # ════════════════════════════════════════════════════════════════
+        # 5. DATA CLEANING — extract numeric price from raw string
+        # ════════════════════════════════════════════════════════════════
         price_digits = re.findall(r"\d[\d,]*\.?\d*", raw_price)
-        
+
         if price_digits:
             clean_price = price_digits[0].replace(",", "")
             status = "Success"
@@ -57,7 +145,7 @@ class AmazonExtractor(BaseExtractor):
             clean_price = "N/A"
             status = "Unavailable/Regional Block"
 
-        # 4. Detect currency
+        # 6. Detect currency from the raw string
         if "PHP" in raw_price or "₱" in raw_price:
             currency = "PHP"
         elif "£" in raw_price:
